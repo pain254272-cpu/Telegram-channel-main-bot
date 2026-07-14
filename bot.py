@@ -37,6 +37,7 @@ from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -94,17 +95,45 @@ async def check_forcesub(app: Application, user_id: int):
     not_joined = []
     for ch_id, ch_data in target_channels.items():
         try:
-            ch_url = ch_data if isinstance(ch_data, str) else ch_data.get('url', '')
-            member = await app.bot.get_chat_member(
-                chat_id=int(ch_id) if ch_id.replace('-','').isdigit() or ch_id.startswith('-') else ch_id, 
-                user_id=user_id
-            )
+            raw_id = str(ch_id).strip()
+            # আইডি ফরম্যাট ফিক্স করা (-100 হ্যান্ডেল করা)
+            if raw_id.startswith('-'):
+                if not raw_id.startswith('-100') and len(raw_id) > 5 and raw_id[1:].isdigit():
+                    final_id = int(raw_id.replace('-', '-100'))
+                else:
+                    final_id = int(raw_id) if raw_id.replace('-','').isdigit() else raw_id
+            elif raw_id.isdigit():
+                final_id = int(f"-100{raw_id}")
+            else:
+                final_id = raw_id
+
+            member = await app.bot.get_chat_member(chat_id=final_id, user_id=user_id)
             if member.status in ['left', 'kicked']:
                 not_joined.append((ch_id, ch_data))
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error checking channel {ch_id}: {e}")
             not_joined.append((ch_id, ch_data))
 
     return len(not_joined) == 0, not_joined
+
+
+# --- Send File Function ---
+async def send_file_to_user(bot, user_id, link_key):
+    link_data = fb_get(f'links/{link_key}')
+    if link_data:
+        try:
+            c_id = int(link_data['chat_id']) if str(link_data['chat_id']).replace('-','').isdigit() or str(link_data['chat_id']).startswith('-') else link_data['chat_id']
+            await bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=c_id,
+                message_id=link_data['message_id'],
+            )
+            return True, "✅ File sent successfully!"
+        except Exception as e:
+            logging.error(f"File Send Error: {e}")
+            return False, "⚠ Failed to send the file. Make sure the bot is an admin in that channel."
+    else:
+        return False, "⚠ File link not found or has been deleted from the database."
 
 
 # --- Command Handlers ---
@@ -180,37 +209,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 keyboard.append([InlineKeyboardButton(text=btn_name, url=ch_url)])
             
-            bot_user = await context.bot.get_me()
-            retry_url = f"https://t.me/{bot_user.username}?start={link_key}"
-            keyboard.append([InlineKeyboardButton(text="🔄 I have joined (Get File)", url=retry_url)])
+            # ফিক্সড: রিট্রাই ইউআরএল এর বদলে ইনস্ট্যান্ট ইনলাইন ভেরিফাই বাটন যোগ করা হয়েছে
+            keyboard.append([InlineKeyboardButton(text="🔄 I have joined (Verify)", callback_data=f"verify_{link_key}")])
             
             reply_markup = InlineKeyboardMarkup(keyboard)
-            alert_text = "❌ **To get the file, you must join our channels first!**\n\n👇 Click the buttons below to join, then click the link again."
+            alert_text = "❌ **To get the file, you must join our channels first!**\n\n👇 Click the buttons below to join, then click the verify button."
             await update.message.reply_text(alert_text, parse_mode="Markdown", reply_markup=reply_markup)
             return
 
-        link_data = fb_get(f'links/{link_key}')
-        if link_data:
-            try:
-                c_id = int(link_data['chat_id']) if str(link_data['chat_id']).replace('-','').isdigit() or str(link_data['chat_id']).startswith('-') else link_data['chat_id']
-                await context.bot.copy_message(
-                    chat_id=user.id,
-                    from_chat_id=c_id,
-                    message_id=link_data['message_id'],
-                )
-            except Exception:
-                await update.message.reply_text("⚠ Failed to send the file. Make sure the bot is an admin in that channel.")
-        else:
-            await update.message.reply_text("⚠ File link not found or has been deleted from the database.")
+        success, msg = await send_file_to_user(context.bot, user.id, link_key)
+        if not success:
+            await update.message.reply_text(msg)
     else:
         await update.message.reply_text("👋 Welcome! I am your File Sharing Bot. To get files, please access through a valid link.")
+
+
+# --- Callback Query Handler (Instant Verification) ---
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    data = query.data
+    
+    if data.startswith("verify_"):
+        link_key = data.split("_")[1]
+        is_joined, channels = await check_forcesub(context.application, user_id)
+        
+        if is_joined:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            
+            success, msg = await send_file_to_user(context.bot, user_id, link_key)
+            if not success:
+                await context.bot.send_message(chat_id=user_id, text=msg)
+        else:
+            await query.answer(text="❌ You haven't joined all channels yet! Please join and try again.", show_alert=True)
 
 
 # Handle all incoming messages
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user = update.effective_user
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
 
     if user_id != ADMIN_ID:
         if fb_get(f'ban_list/{user_id}'): return
@@ -233,8 +276,10 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"❌ Could not send message: {e}")
                 return
 
-    if user_id == ADMIN_ID and "t.me/" in text:
-        parts = text.split('/')
+    # ফিক্সড: t.me, telegram.me এবং telegram.dog সব কাজ করবে
+    if user_id == ADMIN_ID and ("t.me/" in text or "telegram.me/" in text or "telegram.dog/" in text):
+        clean_text = text.replace("https://", "").replace("http://", "")
+        parts = clean_text.split('/')
         try:
             msg_id = int(parts[-1])
             channel_ref = parts[-2]
@@ -255,7 +300,8 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode="Markdown",
             )
             return
-        except Exception:
+        except Exception as e:
+            logging.error(f"Link Gen Error: {e}")
             await update.message.reply_text("⚠ Failed to process the link. Please send a valid public or private channel message link.")
             return
 
@@ -394,8 +440,15 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     try:
         ch_id = context.args[0]
-        btn_name = context.args[1].replace('_', ' ')
-        ch_url = context.args[2]
+        ch_url = context.args[-1]
+        
+        btn_name = " ".join(context.args[1:-1])
+        if not btn_name:
+            btn_name = "Join Channel 📢"
+            
+        raw_id = str(ch_id).strip()
+        if raw_id.startswith('-') and not raw_id.startswith('-100') and raw_id[1:].isdigit():
+            ch_id = raw_id.replace('-', '-100')
         
         channel_data = {
             "name": btn_name,
@@ -403,12 +456,11 @@ async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         
         fb_set(f'settings/channels/{ch_id}', channel_data)
-        await update.message.reply_text(f"✅ Channel `{ch_id}` successfully added with button name **'{btn_name}'**.", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Channel/Group `{ch_id}` successfully added with button name **'{btn_name}'**.", parse_mode="Markdown")
     except IndexError:
         await update.message.reply_text(
             "⚠ **Usage format:**\n`/addchannel <channel_id> <button_name> <link>`\n\n"
-            "**Example:**\n`/addchannel -100123456789 Join_Our_Channel https://t.me/file81626`\n"
-            "*(Tip: Use underscores `_` to include spaces in button names)*", 
+            "**Example:**\n`/addchannel -1005153420698 Join Our Group https://t.me/+w1nBQ...`", 
             parse_mode="Markdown"
         )
 
@@ -418,6 +470,10 @@ async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     try:
         ch_id = context.args[0]
+        raw_id = str(ch_id).strip()
+        if raw_id.startswith('-') and not raw_id.startswith('-100') and raw_id[1:].isdigit():
+            ch_id = raw_id.replace('-', '-100')
+            
         if fb_delete(f'settings/channels/{ch_id}'):
             await update.message.reply_text(f"✅ Channel `{ch_id}` successfully removed.", parse_mode="Markdown")
         else:
@@ -536,7 +592,7 @@ HTML_TEMPLATE = """
                 console.error("Error updating statistics:", error);
             }
         }
-        setInterval(fetchStats, 2000); // 2 সেকেন্ড পর পর তথ্য আপডেট হবে
+        setInterval(fetchStats, 2000);
         window.onload = fetchStats;
     </script>
 </head>
@@ -602,12 +658,10 @@ def index():
 
 @flask_app.route('/api/stats')
 def api_stats():
-    # Gather hardware usage data
     cpu = psutil.cpu_percent(interval=None)
     ram = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
     
-    # Firebase stats for general dashboard context
     all_users = fb_get('users') or {}
     all_links = fb_get('links') or {}
 
@@ -624,14 +678,12 @@ def api_stats():
     })
 
 def run_flask():
-    # Runs the Flask server on port 5000 (Localhost only for security)
     flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
 
 # =========================================================
 
 # --- Main Function ---
 def main():
-    # Start the Flask Dashboard in a background thread
     web_thread = threading.Thread(target=run_flask, daemon=True)
     web_thread.start()
     
@@ -651,13 +703,16 @@ def main():
     app.add_handler(CommandHandler("maintenance", toggle_maintenance))
     app.add_handler(CommandHandler("backup", backup_db))
     
+    # ফিক্সড: কলব্যাক কোয়েরি হ্যান্ডলার (ভেরিফাই বাটনের জন্য) যোগ করা হয়েছে
+    app.add_handler(CallbackQueryHandler(verify_callback))
+    
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
 
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(auto_backup_job, interval=86400, first=10)
 
-    print("🚀 Bot successfully started with English button system...")
+    print("🚀 Bot successfully started with callback support...")
     print("🌐 Monitoring website running on http://localhost:5000")
     app.run_polling()
 
