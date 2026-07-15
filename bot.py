@@ -82,6 +82,10 @@ def sync_firebase_cache():
             settings = db_data.get("settings", {}) or {}
             BOT_CACHE["maintenance"] = settings.get("maintenance", False)
             BOT_CACHE["channels"] = settings.get("channels", {}) or {}
+            
+            # ফায়ারবেস থেকে পেন্ডিং জয়েন রিকোয়েস্টের ডাটাও সিঙ্ক করে নিচ্ছি যাতে বট রিস্টার্ট হলেও ডাটা না হারায়
+            BOT_CACHE["pending_joins"] = db_data.get("pending_joins", {}) or {}
+            
             BOT_CACHE["last_sync"] = datetime.now()
             logging.info("⚡ Firebase Cache Successfully Synced Contextually!")
     except Exception as e:
@@ -109,6 +113,8 @@ def fb_get(path):
         return BOT_CACHE["maintenance"]
     if path == 'settings/channels':
         return BOT_CACHE["channels"]
+    if path == 'pending_joins':
+        return BOT_CACHE["pending_joins"]
     if path.startswith('ban_list/'):
         uid = path.split('/')[-1]
         return BOT_CACHE["ban_list"].get(uid, None)
@@ -133,18 +139,25 @@ def fb_delete(path):
 
 # --- Chat Join Request Handler Function ---
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ইউজার যখনই প্রাইভেট চ্যানেলে জয়েন রিকোয়েস্ট পাঠাবে, এই ফাংশনটি তার আইডি ক্যাশ করে রাখবে"""
+    """ইউজার যখনই প্রাইভেট চ্যানেলে জয়েন রিকোয়েস্ট পাঠাবে, এই ফাংশনটি তার আইডি ক্যাশ এবং ডাটাবেসে পার্মানেন্টলি সেভ করবে"""
     request = update.chat_join_request
     user_id = request.from_user.id
     chat_id = request.chat.id
     
     user_id_str = str(user_id)
-    if user_id_str not in BOT_CACHE["pending_joins"]:
-        BOT_CACHE["pending_joins"][user_id_str] = []
+    
+    # প্রথমে ফায়ারবেস বা ক্যাশ থেকে কারেন্ট লিস্ট তুলে আনা হচ্ছে
+    current_pendings = BOT_CACHE["pending_joins"].get(user_id_str, [])
+    if not isinstance(current_pendings, list):
+        current_pendings = []
         
-    if chat_id not in BOT_CACHE["pending_joins"][user_id_str]:
-        BOT_CACHE["pending_joins"][user_id_str].append(chat_id)
-        logging.info(f"➕ User {user_id} sent a Join Request to {chat_id}. Pending state cached.")
+    if chat_id not in current_pendings:
+        current_pendings.append(chat_id)
+        BOT_CACHE["pending_joins"][user_id_str] = current_pendings
+        
+        # ডাটাবেসে স্থায়ীভাবে ব্যাকআপ রাখা হচ্ছে যাতে বটের মেমরি রিলিজ হলেও পেন্ডিং রিকোয়েস্ট ভেরিফাই হয়
+        fb_set(f'pending_joins/{user_id_str}', current_pendings)
+        logging.info(f"➕ User {user_id} sent a Join Request to {chat_id}. Dynamic database backup complete.")
 
 # --- Helper Function (Forcesub Check & Link Extractor) ---
 async def check_forcesub(app: Application, user_id: int):
@@ -175,8 +188,13 @@ async def check_forcesub(app: Application, user_id: int):
             # ১. প্রথমে চেক করবো ইউজার এই চ্যানেলে জয়েন রিকোয়েস্ট (Pending) পাঠিয়ে রেখেছে কি না
             user_id_str = str(user_id)
             user_pendings = BOT_CACHE["pending_joins"].get(user_id_str, [])
+            
+            # সেফটি মেজারমেন্ট: যদি কোনো কারণে ডাটাবেস স্ট্রিং বা অন্য ফরম্যাটে ডাটা রিটার্ন করে
+            if not isinstance(user_pendings, list):
+                user_pendings = []
+                
             if final_id in user_pendings or str(final_id) in [str(x) for x in user_pendings]:
-                continue  # পেন্ডিং থাকলে সরাসরি পাস (ফাইল পাবে)
+                continue  # পেন্ডিং লিস্টে মিল পাওয়া গেলে সরাসরি পাস (ফাইল পাবে)
 
             # ২. পেন্ডিং না থাকলে সাধারণ মেম্বারশিপ চেক
             member = await app.bot.get_chat_member(chat_id=final_id, user_id=user_id)
@@ -184,9 +202,12 @@ async def check_forcesub(app: Application, user_id: int):
                 not_joined.append((ch_id, ch_data))
         except BadRequest as e:
             # যদি টেলিগ্রাম কোনো কারণে মেম্বার খুঁজে না পায় (প্রাইভেট চ্যানেলের ক্ষেত্রে হতে পারে)
-            # তখনও ক্যাশ থেকে পেন্ডিং রিকোয়েস্ট পুনঃপরীক্ষা করা হবে
+            # তখনও ক্যাশ এবং ডাটাবেস থেকে পেন্ডিং রিকোয়েস্ট পুনঃপরীক্ষা করা হবে
             user_id_str = str(user_id)
             user_pendings = BOT_CACHE["pending_joins"].get(user_id_str, [])
+            if not isinstance(user_pendings, list):
+                user_pendings = []
+                
             if final_id in user_pendings or str(final_id) in [str(x) for x in user_pendings]:
                 continue
                 
@@ -339,6 +360,14 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if data.startswith("verify_"):
         link_key = data.split("_")[1]
+        
+        # ভেরিফিকেশন বাটনে ক্লিক করার ঠিক আগ মুহূর্তে ফায়ারবেস থেকে লাইভ ডাটা লোড করে নেওয়া
+        # যাতে পেন্ডিং রিকোয়েস্ট ক্যাশে যোগ হতে ১ সেকেন্ডও মিস না হয়
+        user_id_str = str(user_id)
+        db_pendings = fb_get(f'pending_joins/{user_id_str}')
+        if db_pendings and isinstance(db_pendings, list):
+            BOT_CACHE["pending_joins"][user_id_str] = db_pendings
+            
         is_joined, channels = await check_forcesub(context.application, user_id)
         
         if is_joined:
@@ -537,7 +566,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_to_send = update.message.reply_to_message
     all_users = fb_get('users')
 
-    if not_users := not all_users:
+    if not all_users:
         await update.message.reply_text("No users found.")
         return
 
@@ -765,7 +794,7 @@ def main():
     app.add_handler(CommandHandler("maintenance", toggle_maintenance))
     app.add_handler(CommandHandler("backup", backup_db))
     
-    # 🚨 প্রাইভেট চ্যানেলে পাঠানো রিকোয়েস্ট ক্যাশ করার নতুন হ্যান্ডলার
+    # 🚨 প্রাইভেট চ্যানেলে পাঠানো রিকোয়েস্ট ক্যাশ করার হ্যান্ডলার
     app.add_handler(ChatJoinRequestHandler(handle_join_request))
     
     app.add_handler(CallbackQueryHandler(verify_callback))
