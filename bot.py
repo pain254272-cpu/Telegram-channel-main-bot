@@ -39,6 +39,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatJoinRequestHandler,  # প্রাইভেট চ্যানেলের জয়েন রিকোয়েস্ট ট্র্যাকিংয়ের জন্য যুক্ত করা হয়েছে
     filters,
     ContextTypes,
 )
@@ -64,7 +65,8 @@ BOT_CACHE = {
     "ban_list": {},
     "maintenance": False,
     "channels": {},
-    "last_sync": None
+    "last_sync": None,
+    "pending_joins": {}  # পেন্ডিং জয়েন রিকোয়েস্ট ট্র্যাকিংয়ের জন্য ক্যাশ
 }
 
 def sync_firebase_cache():
@@ -129,6 +131,21 @@ def fb_delete(path):
         logging.error(f"Firebase Delete Error: {e}")
         return False
 
+# --- Chat Join Request Handler Function ---
+async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ইউজার যখনই প্রাইভেট চ্যানেলে জয়েন রিকোয়েস্ট পাঠাবে, এই ফাংশনটি তার আইডি ক্যাশ করে রাখবে"""
+    request = update.chat_join_request
+    user_id = request.from_user.id
+    chat_id = request.chat.id
+    
+    user_id_str = str(user_id)
+    if user_id_str not in BOT_CACHE["pending_joins"]:
+        BOT_CACHE["pending_joins"][user_id_str] = []
+        
+    if chat_id not in BOT_CACHE["pending_joins"][user_id_str]:
+        BOT_CACHE["pending_joins"][user_id_str].append(chat_id)
+        logging.info(f"➕ User {user_id} sent a Join Request to {chat_id}. Pending state cached.")
+
 # --- Helper Function (Forcesub Check & Link Extractor) ---
 async def check_forcesub(app: Application, user_id: int):
     target_channels = BOT_CACHE["channels"]
@@ -155,10 +172,24 @@ async def check_forcesub(app: Application, user_id: int):
             else:
                 final_id = raw_id
 
+            # ১. প্রথমে চেক করবো ইউজার এই চ্যানেলে জয়েন রিকোয়েস্ট (Pending) পাঠিয়ে রেখেছে কি না
+            user_id_str = str(user_id)
+            user_pendings = BOT_CACHE["pending_joins"].get(user_id_str, [])
+            if final_id in user_pendings or str(final_id) in [str(x) for x in user_pendings]:
+                continue  # পেন্ডিং থাকলে সরাসরি পাস (ফাইল পাবে)
+
+            # ২. পেন্ডিং না থাকলে সাধারণ মেম্বারশিপ চেক
             member = await app.bot.get_chat_member(chat_id=final_id, user_id=user_id)
             if member.status in ['left', 'kicked', 'member_left']:
                 not_joined.append((ch_id, ch_data))
         except BadRequest as e:
+            # যদি টেলিগ্রাম কোনো কারণে মেম্বার খুঁজে না পায় (প্রাইভেট চ্যানেলের ক্ষেত্রে হতে পারে)
+            # তখনও ক্যাশ থেকে পেন্ডিং রিকোয়েস্ট পুনঃপরীক্ষা করা হবে
+            user_id_str = str(user_id)
+            user_pendings = BOT_CACHE["pending_joins"].get(user_id_str, [])
+            if final_id in user_pendings or str(final_id) in [str(x) for x in user_pendings]:
+                continue
+                
             logging.info(f"User {user_id} not in chat {ch_id}: {e}")
             not_joined.append((ch_id, ch_data))
         except Exception as e:
@@ -506,7 +537,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_to_send = update.message.reply_to_message
     all_users = fb_get('users')
 
-    if not all_users:
+    if not_users := not all_users:
         await update.message.reply_text("No users found.")
         return
 
@@ -733,6 +764,9 @@ def main():
     app.add_handler(CommandHandler("unban", unban_user))
     app.add_handler(CommandHandler("maintenance", toggle_maintenance))
     app.add_handler(CommandHandler("backup", backup_db))
+    
+    # 🚨 প্রাইভেট চ্যানেলে পাঠানো রিকোয়েস্ট ক্যাশ করার নতুন হ্যান্ডলার
+    app.add_handler(ChatJoinRequestHandler(handle_join_request))
     
     app.add_handler(CallbackQueryHandler(verify_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_all_messages))
