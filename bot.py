@@ -314,10 +314,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if ch_url:
                     keyboard.append([InlineKeyboardButton(text=btn_name, url=ch_url)])
             
-            keyboard.append([InlineKeyboardButton(text="🔄 I have joined (Verify)", callback_data=f"verify_{link_key}")])
+            keyboard.append([InlineKeyboardButton(text="✅ Verify & Get File.", callback_data=f"verify_{link_key}")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            alert_text = "❌ **To get the file, you must join our channels/groups first!**\n\n👇 Click the buttons below to join, then click the verify button."
+            alert_text = "📋 **To access the file, please complete these steps:**\n\n1️⃣ Join **all the required channels**.\n2️⃣ Click **✅ Verify & Get File**.\n3️⃣ Once your membership is verified, your file will be available instantly.\n\n⚠️ **Important:** You must join **every required channel** to unlock access to the file."
             await update.message.reply_text(alert_text, parse_mode="Markdown", reply_markup=reply_markup)
             return
 
